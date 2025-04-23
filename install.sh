@@ -56,6 +56,7 @@ source .venv/bin/activate
 # Install Python dependencies
 echo -e "${GREEN}Installing Python dependencies...${NC}"
 pip install --upgrade pip
+pip install "python-telegram-bot[job-queue]"
 pip install -r requirements.txt
 
 # Get Telegram bot token
