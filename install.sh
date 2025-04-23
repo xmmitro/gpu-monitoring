@@ -34,6 +34,7 @@ fi
 echo -e "${GREEN}Cleaning old files...${NC}"
 rm -rf monitoring
 rm -rf /var/log/system_monitor.log
+screen -S gpubot -X quit
 
 # Install system dependencies
 echo -e "${GREEN}Installing system dependencies...${NC}"
