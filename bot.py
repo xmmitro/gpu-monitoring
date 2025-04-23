@@ -5,13 +5,14 @@ import subprocess
 import psutil
 import time
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # Configuration
-BOT_TOKEN = "YOUR_BOT_TOKEN"  # Replace with your Telegram Bot Token
-LOG_FILE = "/var/log/gpu_monitor.log"
+BOT_TOKEN = "YOUR_BOT_TOKEN"  # Replaced by install.sh
+LOG_FILE = "/var/log/system_monitor.log"
 THRESHOLDS = {
     "gpu_util": 80,  # Alert if GPU utilization > 80%
     "mem_util": 80,  # Alert if memory utilization > 80%
@@ -24,13 +25,15 @@ ALERT_CONFIG = {
     "vram_alert_threshold": 95,  # Alert if VRAM usage > 95%
     "snooze_duration": 300,  # Snooze alerts for 5 minutes
 }
-PROCESS_ALERTS = {}  # Store process-specific alerts {chat_id: {pid: {name, vram_threshold}}}
 
-# Global state
-monitoring_jobs = {}  # {chat_id: {job, message_id}}
-last_message_ids = {}  # {chat_id: message_id}
-alert_snooze = {}  # {chat_id: {metric: timestamp}}
-gpu_count = 0  # Number of GPUs detected
+# Global state (thread-safe with dictionary access)
+monitoring_jobs: Dict[int, Dict] = {}  # {chat_id: {job, message_id, interval}}
+last_message_ids: Dict[int, int] = {}  # {chat_id: message_id}
+alert_snooze: Dict[int, Dict[str, float]] = {}  # {chat_id: {metric: timestamp}}
+PROCESS_ALERTS: Dict[int, Dict[str, Dict]] = {}  # {chat_id: {pid: {name, vram_threshold, start_time}}}
+gpu_count: int = 0  # Number of GPUs detected
+gpu_util_history: List[float] = []  # GPU utilization history for charts
+cpu_usage_history: List[float] = []  # CPU usage history for charts
 
 # Setup logging
 logging.basicConfig(
@@ -43,8 +46,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Inline keyboard
-def get_keyboard(is_monitoring: bool = False, gpu_count: int = 1) -> InlineKeyboardMarkup:
+# Inline keyboard with enhanced options
+def get_keyboard(is_monitoring: bool = False, gpu_count: int = 1, chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton("📊 GPU Metrics", callback_data="gpu"),
@@ -55,6 +58,7 @@ def get_keyboard(is_monitoring: bool = False, gpu_count: int = 1) -> InlineKeybo
             InlineKeyboardButton("⚠️ Watch Process", callback_data="watch_process")
         ],
         [
+            InlineKeyboardButton("📈 Status", callback_data="status"),
             InlineKeyboardButton("❓ Help", callback_data="help")
         ]
     ]
@@ -63,16 +67,20 @@ def get_keyboard(is_monitoring: bool = False, gpu_count: int = 1) -> InlineKeybo
             InlineKeyboardButton(f"GPU {i}", callback_data=f"gpu_{i}") for i in range(gpu_count)
         ]
         keyboard.insert(1, gpu_buttons)
+    monitoring_buttons = []
     if is_monitoring:
-        keyboard.append([InlineKeyboardButton("⏹️ Stop Monitoring", callback_data="stop_monitoring")])
+        monitoring_buttons.append(InlineKeyboardButton("⏹️ Stop Monitoring", callback_data="stop_monitoring"))
     else:
-        keyboard.append([InlineKeyboardButton("▶️ Start Monitoring", callback_data="start_monitoring")])
+        monitoring_buttons.append(InlineKeyboardButton("▶️ Start Monitoring", callback_data="start_monitoring"))
+    if chat_id in PROCESS_ALERTS and PROCESS_ALERTS[chat_id]:
+        monitoring_buttons.append(InlineKeyboardButton("🛑 Stop Watching", callback_data="stop_watching"))
+    keyboard.append(monitoring_buttons)
     return InlineKeyboardMarkup(keyboard)
 
-# ASCII chart generator
-def generate_ascii_chart(values: list, width: int = 20, height: int = 5) -> str:
+# ASCII chart generator with improved scaling
+def generate_ascii_chart(values: List[float], width: int = 20, height: int = 5, label: str = "") -> str:
     if not values:
-        return "No data for chart."
+        return f"📉 *{label}*: No data available."
     max_val = max(values, default=100)
     min_val = min(values, default=0)
     if max_val == min_val:
@@ -87,22 +95,22 @@ def generate_ascii_chart(values: list, width: int = 20, height: int = 5) -> str:
             else:
                 line.append(" ")
         chart.append("".join(line))
-    return "```\n" + "\n".join(chart) + "\n```"
+    return f"📉 *{label}* (Min: {min_val:.1f}, Max: {max_val:.1f}):\n```\n" + "\n".join(chart) + "\n```"
 
-# Function to log messages
+# Log messages with timestamp
 def log_message(message: str) -> None:
     logger.info(message)
 
-# Function to delete previous message
+# Delete previous message to keep chat clean
 async def delete_previous_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     if chat_id in last_message_ids:
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=last_message_ids[chat_id])
+            del last_message_ids[chat_id]
         except Exception as e:
-            log_message(f"Failed to delete message {last_message_ids[chat_id]}: {e}")
-        del last_message_ids[chat_id]
+            log_message(f"Failed to delete message {last_message_ids.get(chat_id, 'unknown')}: {e}")
 
-# Function to detect GPU count
+# Detect GPU count with error handling
 def detect_gpu_count() -> int:
     try:
         result = subprocess.run(
@@ -111,67 +119,71 @@ def detect_gpu_count() -> int:
             text=True,
             check=True
         )
-        return int(result.stdout.strip())
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return 1  # Assume single GPU if detection fails
+        return max(1, int(result.stdout.strip()))
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as e:
+        log_message(f"Error detecting GPU count: {e}")
+        return 1
 
-# Function to get NVIDIA GPU metrics
-async def get_gpu_metrics(gpu_index: int = 0) -> str:
+# Get NVIDIA GPU metrics with caching and fan speed
+async def get_gpu_metrics(gpu_index: int = 0, cache_duration: float = 2.0) -> str:
+    global gpu_util_history
+    cache_key = f"gpu_{gpu_index}_{int(time.time() // cache_duration)}"
+    if cache_key in globals().get('_cache', {}):
+        return globals()['_cache'][cache_key]
+
     try:
         result = subprocess.run(
-            ['nvidia-smi', f'--query-gpu=index,name,utilization.gpu,utilization.memory,memory.total,memory.used,memory.free,temperature.gpu,power.draw', f'--format=csv,noheader,nounits', f'--id={gpu_index}'],
+            ['nvidia-smi', f'--query-gpu=index,name,utilization.gpu,utilization.memory,memory.total,memory.used,memory.free,temperature.gpu,power.draw,fan.speed', f'--format=csv,noheader,nounits', f'--id={gpu_index}'],
             capture_output=True,
             text=True,
             check=True
         )
         output = result.stdout.strip()
-        index, gpu_name, gpu_util, mem_util, vram_total, vram_used, vram_free, temp, power = output.split(', ')
+        index, gpu_name, gpu_util, mem_util, vram_total, vram_used, vram_free, temp, power, fan_speed = output.split(', ')
         
         gpu_name = gpu_name.strip()
-        gpu_util = int(gpu_util.replace('%', ''))
-        mem_util = int(mem_util.replace('%', ''))
+        gpu_util = int(gpu_util.replace('%', '')) if '%' in gpu_util else 0
+        mem_util = int(mem_util.replace('%', '')) if '%' in mem_util else 0
         vram_total = int(vram_total)
         vram_used = int(vram_used)
         vram_free = int(vram_free)
         temp = int(temp)
-        power = float(power)
+        power = float(power) if power != 'N/A' else 0.0
+        fan_speed = int(fan_speed.replace('%', '')) if '%' in fan_speed else 0
         
-        vram_usage = (vram_used / vram_total) * 100
+        vram_usage = (vram_used / vram_total) * 100 if vram_total > 0 else 0
         
-        # Generate ASCII chart for GPU utilization
         gpu_util_history.append(gpu_util)
         if len(gpu_util_history) > 20:
             gpu_util_history.pop(0)
-        chart = generate_ascii_chart(gpu_util_history, width=20, height=5)
+        chart = generate_ascii_chart(gpu_util_history, width=20, height=5, label="GPU Utilization (%)")
         
-        message = f"📊 *GPU {index} Monitoring Report* - {subprocess.getoutput('hostname')}\n"
+        message = f"📊 *GPU {index} Monitoring Report* - {subprocess.getoutput('hostname')} 🖥️\n"
         message += f"*GPU*: {gpu_name}\n"
         message += f"*GPU Utilization*: {gpu_util}% {'⚠️ High' if gpu_util > THRESHOLDS['gpu_util'] else ''}\n"
         message += f"*Memory Utilization*: {mem_util}% {'⚠️ High' if mem_util > THRESHOLDS['mem_util'] else ''}\n"
         message += f"*VRAM Usage*: {vram_used} MB / {vram_total} MB ({vram_usage:.2f}%) {'⚠️ High' if vram_usage > THRESHOLDS['vram_usage'] else ''}\n"
         message += f"*Temperature*: {temp}°C {'⚠️ High' if temp > THRESHOLDS['temp'] else ''}\n"
-        message += f"*Power Draw*: {power} W\n"
-        message += f"*Utilization Chart*:\n{chart}"
+        message += f"*Power Draw*: {power:.1f} W\n"
+        message += f"*Fan Speed*: {fan_speed}%\n"
+        message += f"{chart}"
         
-        # Check for critical alerts
-        if vram_usage > ALERT_CONFIG["vram_alert_threshold"] and not is_snoozed(chat_id, "vram"):
-            await send_alert(context, chat_id, f"🚨 *Critical VRAM Usage* on GPU {index}: {vram_usage:.2f}%")
-        if temp > THRESHOLDS["temp"] and not is_snoozed(chat_id, "temp"):
-            await send_alert(context, chat_id, f"🚨 *High Temperature* on GPU {index}: {temp}°C")
-        
-        log_message(f"GPU {index} Metrics: {gpu_name}, Util: {gpu_util}%, Mem: {mem_util}%, VRAM: {vram_used}/{vram_total} MB, Temp: {temp}°C, Power: {power} W")
+        globals().setdefault('_cache', {})[cache_key] = message
+        log_message(f"GPU {index} Metrics: {gpu_name}, Util: {gpu_util}%, Mem: {mem_util}%, VRAM: {vram_used}/{vram_total} MB, Temp: {temp}°C, Power: {power} W, Fan: {fan_speed}%")
         return message
     except FileNotFoundError:
-        return "🚨 *Error*: nvidia-smi not found. Ensure NVIDIA drivers are installed."
+        message = "🚨 *Error*: nvidia-smi not found. Ensure NVIDIA drivers are installed."
     except subprocess.CalledProcessError as e:
+        message = f"🚨 *Error*: Failed to fetch GPU {gpu_index} metrics.\n*Details*: {e.stderr}"
         log_message(f"Error fetching GPU {gpu_index} metrics: {e}")
-        return f"🚨 *Error*: Failed to fetch GPU {gpu_index} metrics.\n*Details*: {e.stderr}"
+    return message
 
-# Function to get system metrics
+# Get system metrics with enhanced details
 async def get_system_metrics() -> str:
+    global cpu_usage_history
     try:
-        cpu_usage = psutil.cpu_percent(interval=1)
-        cpu_per_core = psutil.cpu_percent(interval=1, percpu=True)
+        cpu_usage = psutil.cpu_percent(interval=0.5)
+        cpu_per_core = psutil.cpu_percent(interval=0.5, percpu=True)
         
         ram = psutil.virtual_memory()
         ram_total = ram.total / (1024 ** 3)
@@ -179,33 +191,31 @@ async def get_system_metrics() -> str:
         ram_usage = ram.percent
         
         disk_io = psutil.disk_io_counters()
-        disk_read = disk_io.read_bytes / (1024 ** 3)
-        disk_write = disk_io.write_bytes / (1024 ** 3)
+        disk_read = disk_io.read_bytes / (1024 ** 3) if disk_io else 0
+        disk_write = disk_io.write_bytes / (1024 ** 3) if disk_io else 0
         
         net_io = psutil.net_io_counters()
-        net_sent = net_io.bytes_sent / (1024 ** 2)
-        net_recv = net_io.bytes_recv / (1024 ** 2)
+        net_sent = net_io.bytes_sent / (1024 ** 2) if net_io else 0
+        net_recv = net_io.bytes_recv / (1024 ** 2) if net_io else 0
         
-        # System uptime and load
         uptime_seconds = time.time() - psutil.boot_time()
-        uptime = f"{int(uptime_seconds // 86400)}d {int((uptime_seconds % 86400) // 3600)}h {int((uptime_seconds % 3600) // 60)}m"
+        uptime = str(timedelta(seconds=int(uptime_seconds)))
         load_avg = psutil.getloadavg()
         
-        # ASCII chart for CPU usage
         cpu_usage_history.append(cpu_usage)
         if len(cpu_usage_history) > 20:
             cpu_usage_history.pop(0)
-        chart = generate_ascii_chart(cpu_usage_history, width=20, height=5)
+        chart = generate_ascii_chart(cpu_usage_history, width=20, height=5, label="CPU Usage (%)")
         
-        message = f"💻 *System Monitoring Report* - {subprocess.getoutput('hostname')}\n"
+        message = f"💻 *System Monitoring Report* - {subprocess.getoutput('hostname')} 🖥️\n"
         message += f"*Uptime*: {uptime}\n"
         message += f"*Load Average*: {load_avg[0]:.2f}, {load_avg[1]:.2f}, {load_avg[2]:.2f} (1m, 5m, 15m)\n"
-        message += f"*CPU Usage*: {cpu_usage}% {'⚠️ High' if cpu_usage > THRESHOLDS['cpu_usage'] else ''}\n"
-        message += f"*CPU Per Core*: {', '.join([f'{i}: {p}%' for i, p in enumerate(cpu_per_core)])}\n"
-        message += f"*RAM Usage*: {ram_used:.2f} GB / {ram_total:.2f} GB ({ram_usage:.2f}%) {'⚠️ High' if ram_usage > THRESHOLDS['ram_usage'] else ''}\n"
+        message += f"*CPU Usage*: {cpu_usage:.1f}% {'⚠️ High' if cpu_usage > THRESHOLDS['cpu_usage'] else ''}\n"
+        message += f"*CPU Per Core*: {', '.join([f'Core {i}: {p:.1f}%' for i, p in enumerate(cpu_per_core)])}\n"
+        message += f"*RAM Usage*: {ram_used:.2f} GB / {ram_total:.2f} GB ({ram_usage:.1f}%) {'⚠️ High' if ram_usage > THRESHOLDS['ram_usage'] else ''}\n"
         message += f"*Disk I/O*: Read: {disk_read:.2f} GB, Write: {disk_write:.2f} GB\n"
         message += f"*Network I/O*: Sent: {net_sent:.2f} MB, Received: {net_recv:.2f} MB\n"
-        message += f"*CPU Usage Chart*:\n{chart}"
+        message += f"{chart}"
         
         log_message(f"System Metrics: CPU: {cpu_usage}%, RAM: {ram_usage}%, Disk R/W: {disk_read}/{disk_write} GB, Net S/R: {net_sent}/{net_recv} MB")
         return message
@@ -213,7 +223,7 @@ async def get_system_metrics() -> str:
         log_message(f"Error fetching system metrics: {e}")
         return f"🚨 *Error*: Failed to fetch system metrics.\n*Details*: {str(e)}"
 
-# Function to get GPU-related processes
+# Get GPU-related processes with runtime
 async def get_gpu_processes() -> str:
     try:
         result = subprocess.run(
@@ -226,11 +236,16 @@ async def get_gpu_processes() -> str:
         if not processes:
             return "ℹ️ *No processes* are currently using any GPU."
         
-        message = f"🔄 *GPU Processes* - {subprocess.getoutput('hostname')}\n"
+        message = f"🔄 *GPU Processes* - {subprocess.getoutput('hostname')} 🖥️\n"
         for line in processes.split('\n'):
             pid, proc_name, mem, gpu_uuid = line.split(', ')
             gpu_index = get_gpu_index_from_uuid(gpu_uuid)
-            message += f"*GPU {gpu_index}* - *PID*: {pid}, *Name*: {proc_name}, *VRAM*: {mem}\n"
+            try:
+                proc = psutil.Process(int(pid))
+                runtime = timedelta(seconds=int(time.time() - proc.create_time()))
+                message += f"*GPU {gpu_index}* - *PID*: {pid}, *Name*: {proc_name}, *VRAM*: {mem}, *Runtime*: {runtime}\n"
+            except psutil.NoSuchProcess:
+                message += f"*GPU {gpu_index}* - *PID*: {pid}, *Name*: {proc_name}, *VRAM*: {mem}, *Runtime*: Unknown\n"
         
         log_message(f"GPU Processes: {processes}")
         return message
@@ -240,8 +255,11 @@ async def get_gpu_processes() -> str:
         log_message(f"Error fetching GPU processes: {e}")
         return f"🚨 *Error*: Failed to fetch GPU processes.\n*Details*: {e.stderr}"
 
-# Function to get GPU index from UUID
+# Get GPU index from UUID with caching
 def get_gpu_index_from_uuid(uuid: str) -> str:
+    cache = globals().setdefault('_uuid_cache', {})
+    if uuid in cache:
+        return cache[uuid]
     try:
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=index,uuid', '--format=csv,noheader'],
@@ -251,14 +269,16 @@ def get_gpu_index_from_uuid(uuid: str) -> str:
         )
         for line in result.stdout.strip().split('\n'):
             index, gpu_uuid = line.split(', ')
+            cache[gpu_uuid] = index
             if gpu_uuid == uuid:
                 return index
         return "Unknown"
-    except:
+    except Exception as e:
+        log_message(f"Error mapping GPU UUID: {e}")
         return "Unknown"
 
-# Function to list processes for watching
-async def list_processes_for_watching() -> str:
+# List processes for watching with interactive buttons
+async def list_processes_for_watching(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
     try:
         result = subprocess.run(
             ['nvidia-smi', '--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader'],
@@ -268,23 +288,26 @@ async def list_processes_for_watching() -> str:
         )
         processes = result.stdout.strip()
         if not processes:
-            return "ℹ️ *No processes* are currently using the GPU."
+            return "ℹ️ *No processes* are currently using the GPU.", get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         
-        message = "⚠️ *GPU Processes Available for Monitoring*\n"
-        message += "Reply with `/watch <pid>` or `/watch <process_name>` to monitor a process.\n\n"
+        message = "⚠️ *GPU Processes Available for Monitoring* 🔍\n"
+        message += "Click a button to monitor a process or use `/watch <pid> [vram_threshold]` or `/watch <process_name> [vram_threshold]`.\n\n"
+        buttons = []
         for line in processes.split('\n'):
             pid, proc_name, mem = line.split(', ')
             message += f"*PID*: {pid}, *Name*: {proc_name}, *VRAM*: {mem}\n"
+            buttons.append([InlineKeyboardButton(f"Monitor {proc_name} (PID {pid})", callback_data=f"watch_pid_{pid}")])
         
         log_message(f"Listed processes for watching: {processes}")
-        return message
+        keyboard = InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("⬅️ Back", callback_data="back")]])
+        return message, keyboard
     except FileNotFoundError:
-        return "🚨 *Error*: nvidia-smi not found. Ensure NVIDIA drivers are installed."
+        return "🚨 *Error*: nvidia-smi not found. Ensure NVIDIA drivers are installed.", get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
     except subprocess.CalledProcessError as e:
         log_message(f"Error listing GPU processes: {e}")
-        return f"🚨 *Error*: Failed to list GPU processes.\n*Details*: {e.stderr}"
+        return f"🚨 *Error*: Failed to list GPU processes.\n*Details*: {e.stderr}", get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
 
-# Function to check process alerts
+# Check process alerts with improved tracking
 async def check_process_alerts(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     if chat_id not in PROCESS_ALERTS:
         return
@@ -295,32 +318,34 @@ async def check_process_alerts(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
             text=True,
             check=True
         )
-        processes = result.stdout.strip().split('\n')
-        for pid, config in PROCESS_ALERTS[chat_id].items():
-            for line in processes:
-                proc_pid, proc_name, mem = line.split(', ')
-                if proc_pid == pid or proc_name == config["name"]:
-                    mem_mb = int(re.findall(r'\d+', mem)[0])
-                    if mem_mb > config["vram_threshold"]:
-                        await send_alert(
-                            context,
-                            chat_id,
-                            f"🚨 *Process Alert*: {proc_name} (PID {proc_pid}) is using {mem_mb} MB VRAM, exceeding threshold of {config['vram_threshold']} MB."
-                        )
-                    break
-            else:
+        processes = {pid: (name, mem) for line in result.stdout.strip().split('\n') for pid, name, mem in [line.split(', ')]} if result.stdout.strip() else {}
+        
+        for pid, config in list(PROCESS_ALERTS[chat_id].items()):
+            if pid not in processes:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"ℹ️ *Process Alert*: {config['name']} (PID {pid}) is no longer running.",
+                    text=f"ℹ️ *Process Stopped*: {config['name']} (PID {pid}) is no longer running.",
                     parse_mode='Markdown'
                 )
                 del PROCESS_ALERTS[chat_id][pid]
-                if not PROCESS_ALERTS[chat_id]:
-                    del PROCESS_ALERTS[chat_id]
+                continue
+            
+            proc_name, mem = processes[pid]
+            mem_mb = int(re.findall(r'\d+', mem)[0]) if re.findall(r'\d+', mem) else 0
+            if mem_mb > config["vram_threshold"]:
+                runtime = timedelta(seconds=int(time.time() - config["start_time"]))
+                await send_alert(
+                    context,
+                    chat_id,
+                    f"🚨 *Process Alert*: {proc_name} (PID {pid}) is using {mem_mb} MB VRAM, exceeding threshold of {config['vram_threshold']} MB.\n*Runtime*: {runtime}"
+                )
+        
+        if not PROCESS_ALERTS[chat_id]:
+            del PROCESS_ALERTS[chat_id]
     except Exception as e:
         log_message(f"Error checking process alerts: {e}")
 
-# Function to send alerts
+# Send alerts with improved formatting
 async def send_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message: str) -> None:
     await context.bot.send_message(
         chat_id=chat_id,
@@ -331,54 +356,62 @@ async def send_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message: 
         ])
     )
 
-# Function to check if alert is snoozed
+# Check if alert is snoozed
 def is_snoozed(chat_id: int, metric: str) -> bool:
-    if chat_id in alert_snooze and metric in alert_snooze[chat_id]:
-        return time.time() < alert_snooze[chat_id][metric]
-    return False
+    return chat_id in alert_snooze and metric in alert_snooze[chat_id] and time.time() < alert_snooze[chat_id][metric]
 
 # Telegram command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global gpu_count, gpu_util_history, cpu_usage_history
     gpu_count = detect_gpu_count()
-    gpu_util_history = []  # Reset history for ASCII charts
+    gpu_util_history = []
     cpu_usage_history = []
     
     chat_id = update.message.chat_id
     await delete_previous_message(context, chat_id)
     
     message = await update.message.reply_text(
-        f"👋 *Welcome to the GPU & System Monitoring Bot!*\n"
-        f"Detected {gpu_count} GPU(s) on {subprocess.getoutput('hostname')}.\n"
-        "Monitor your server with these options:\n"
-        "- 📊 *GPU Metrics*: GPU usage, VRAM, temperature\n"
-        "- 💻 *System Metrics*: CPU, RAM, disk, network\n"
-        "- 🔄 *GPU Processes*: Processes using GPUs\n"
-        "- ⚠️ *Watch Process*: Monitor specific processes\n"
-        "- ▶️ *Start Monitoring*: Continuous updates\n"
-        "- ❓ *Help*: Show this message\n\n"
-        "Use the buttons below to get started!",
-        reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count),
+        f"👋 *Welcome to GPU & System Monitoring Bot* on {subprocess.getoutput('hostname')} 🚀\n"
+        f"Detected {gpu_count} GPU(s). Ready to monitor your server!\n\n"
+        "🔍 *What can I do?*\n"
+        "- 📊 Check GPU usage, VRAM, and temperature\n"
+        "- 💻 Monitor CPU, RAM, disk, and network\n"
+        "- 🔄 List GPU processes\n"
+        "- ⚠️ Watch specific processes\n"
+        "- ▶️ Start continuous monitoring\n\n"
+        "Use the buttons below or type /help for more!",
+        reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count, chat_id=chat_id),
         parse_mode='Markdown'
     )
     last_message_ids[chat_id] = message.message_id
+    log_message(f"Bot started for chat {chat_id}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     await delete_previous_message(context, chat_id)
     
     message = await update.message.reply_text(
-        "❓ *Help - GPU & System Monitoring Bot*\n"
-        "Available commands and buttons:\n"
-        "- 📊 *GPU Metrics*: Fetch GPU utilization, VRAM, temperature, power draw\n"
-        "- 💻 *System Metrics*: Fetch CPU, RAM, disk I/O, network I/O, uptime\n"
-        "- 🔄 *GPU Processes*: List processes using GPUs\n"
-        "- ⚠️ *Watch Process*: Monitor a process by PID or name\n"
-        "- ▶️ *Start Monitoring*: Start continuous updates (every 60s)\n"
-        "- ⏹️ *Stop Monitoring*: Stop continuous updates\n"
-        "- ❓ *Help*: Show this message\n\n"
-        "Click a button to proceed!",
-        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count),
+        "❓ *GPU & System Monitoring Bot Help* 🛠️\n\n"
+        "*Commands:*\n"
+        "- /start: Initialize the bot\n"
+        "- /gpu: Show GPU metrics\n"
+        "- /system: Show system metrics\n"
+        "- /processes: List GPU processes\n"
+        "- /watch_process: List processes to monitor\n"
+        "- /watch <pid/name> [vram_threshold]: Monitor a process\n"
+        "- /status: Show monitoring and watched processes\n"
+        "- /start_monitoring [interval]: Start continuous monitoring\n"
+        "- /stop_monitoring: Stop continuous monitoring\n"
+        "- /help: Show this help\n\n"
+        "*Buttons:*\n"
+        "- 📊 GPU Metrics\n"
+        "- 💻 System Metrics\n"
+        "- 🔄 GPU Processes\n"
+        "- ⚠️ Watch Process\n"
+        "- 📈 Status\n"
+        "- ▶️ Start/⏹️ Stop Monitoring\n\n"
+        "Click a button to explore!",
+        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id),
         parse_mode='Markdown'
     )
     last_message_ids[chat_id] = message.message_id
@@ -390,7 +423,7 @@ async def gpu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = await update.message.reply_text(
         await get_gpu_metrics(gpu_index=0),
         parse_mode='Markdown',
-        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
     )
     last_message_ids[chat_id] = message.message_id
 
@@ -401,7 +434,7 @@ async def system(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = await update.message.reply_text(
         await get_system_metrics(),
         parse_mode='Markdown',
-        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
     )
     last_message_ids[chat_id] = message.message_id
 
@@ -412,7 +445,7 @@ async def processes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = await update.message.reply_text(
         await get_gpu_processes(),
         parse_mode='Markdown',
-        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
     )
     last_message_ids[chat_id] = message.message_id
 
@@ -420,10 +453,11 @@ async def watch_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat_id = update.message.chat_id
     await delete_previous_message(context, chat_id)
     
+    message_text, keyboard = await list_processes_for_watching(chat_id)
     message = await update.message.reply_text(
-        await list_processes_for_watching(),
+        message_text,
         parse_mode='Markdown',
-        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+        reply_markup=keyboard
     )
     last_message_ids[chat_id] = message.message_id
 
@@ -433,21 +467,31 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     if not context.args:
         message = await update.message.reply_text(
-            "⚠️ *Usage*: `/watch <pid>` or `/watch <process_name>`\n"
-            "Use the Watch Process button to list available processes.",
+            "⚠️ *Usage*: `/watch <pid/name> [vram_threshold]`\n"
+            "Example: `/watch 1234 1000` or `/watch python 1000`\n"
+            "Use /watch_process to list available processes.",
             parse_mode='Markdown',
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
         last_message_ids[chat_id] = message.message_id
         return
     
     identifier = context.args[0]
-    vram_threshold = 1000  # Default VRAM threshold (1GB)
+    vram_threshold = 1000
     if len(context.args) > 1:
         try:
             vram_threshold = int(context.args[1])
+            if vram_threshold < 0:
+                raise ValueError("Threshold must be non-negative")
         except ValueError:
-            vram_threshold = 1000
+            message = await update.message.reply_text(
+                "🚨 *Error*: VRAM threshold must be a non-negative number.\n"
+                "Example: `/watch 1234 1000`",
+                parse_mode='Markdown',
+                reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+            )
+            last_message_ids[chat_id] = message.message_id
+            return
     
     try:
         result = subprocess.run(
@@ -456,31 +500,65 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text=True,
             check=True
         )
-        processes = result.stdout.strip().split('\n')
+        processes = result.stdout.strip().split('\n') if result.stdout.strip() else []
         for line in processes:
             pid, proc_name, mem = line.split(', ')
             if pid == identifier or proc_name.lower() == identifier.lower():
                 if chat_id not in PROCESS_ALERTS:
                     PROCESS_ALERTS[chat_id] = {}
-                PROCESS_ALERTS[chat_id][pid] = {"name": proc_name, "vram_threshold": vram_threshold}
+                PROCESS_ALERTS[chat_id][pid] = {
+                    "name": proc_name,
+                    "vram_threshold": vram_threshold,
+                    "start_time": time.time()
+                }
                 message = await update.message.reply_text(
-                    f"✅ *Monitoring Process*: {proc_name} (PID {pid}) for VRAM > {vram_threshold} MB.",
+                    f"✅ *Monitoring Process*: {proc_name} (PID {pid}) for VRAM > {vram_threshold} MB.\n"
+                    "Use /status to view all watched processes.",
                     parse_mode='Markdown',
-                    reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+                    reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
                 )
                 last_message_ids[chat_id] = message.message_id
+                log_message(f"Started watching {proc_name} (PID {pid}) for chat {chat_id}")
                 return
         message = await update.message.reply_text(
-            f"🚨 *Error*: Process with PID or name '{identifier}' not found.",
+            f"🚨 *Error*: Process with PID or name '{identifier}' not found.\n"
+            "Use /watch_process to list available processes.",
             parse_mode='Markdown',
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
     except Exception as e:
         message = await update.message.reply_text(
             f"🚨 *Error*: Failed to fetch processes.\n*Details*: {str(e)}",
             parse_mode='Markdown',
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
+    last_message_ids[chat_id] = message.message_id
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.message.chat_id
+    await delete_previous_message(context, chat_id)
+    
+    message = f"📈 *Monitoring Status* - {subprocess.getoutput('hostname')} 🖥️\n\n"
+    if chat_id in monitoring_jobs:
+        interval = monitoring_jobs[chat_id]["interval"]
+        message += f"▶️ *Continuous Monitoring*: Active (every {interval} seconds)\n"
+    else:
+        message += "⏹️ *Continuous Monitoring*: Not active\n"
+    
+    if chat_id in PROCESS_ALERTS and PROCESS_ALERTS[chat_id]:
+        message += "\n⚠️ *Watched Processes*:\n"
+        for pid, config in PROCESS_ALERTS[chat_id].items():
+            runtime = timedelta(seconds=int(time.time() - config["start_time"]))
+            message += f"- *{config['name']}* (PID {pid}): VRAM > {config['vram_threshold']} MB, *Runtime*: {runtime}\n"
+    else:
+        message += "\n⚠️ *Watched Processes*: None\n"
+    
+    message += "\nUse buttons to start/stop monitoring or watch processes."
+    message = await update.message.reply_text(
+        message,
+        parse_mode='Markdown',
+        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+    )
     last_message_ids[chat_id] = message.message_id
 
 async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -488,35 +566,53 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await delete_previous_message(context, chat_id)
     
     if chat_id in monitoring_jobs:
+        interval = monitoring_jobs[chat_id]["interval"]
         message = await update.message.reply_text(
-            "ℹ️ *Continuous monitoring* is already running. Use the Stop Monitoring button.",
-            reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count),
+            f"ℹ️ *Continuous monitoring* is already running (every {interval} seconds).\n"
+            "Use the Stop Monitoring button to stop.",
+            reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count, chat_id=chat_id),
             parse_mode='Markdown'
         )
         last_message_ids[chat_id] = message.message_id
         return
     
     interval = 60
+    if context.args:
+        try:
+            interval = int(context.args[0])
+            if interval < 10 or interval > 3600:
+                raise ValueError("Interval must be between 10 and 3600 seconds")
+        except ValueError:
+            message = await update.message.reply_text(
+                "🚨 *Error*: Interval must be a number between 10 and 3600 seconds.\n"
+                "Example: `/start_monitoring 30`",
+                parse_mode='Markdown',
+                reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count, chat_id=chat_id)
+            )
+            last_message_ids[chat_id] = message.message_id
+            return
+    
     job = context.job_queue.run_repeating(
         monitor_callback,
         interval=interval,
-        context=chat_id,
+        first=0,
+        data=chat_id,
         name=str(chat_id)
     )
-    monitoring_jobs[chat_id] = {"job": job, "message_id": None}
+    monitoring_jobs[chat_id] = {"job": job, "message_id": None, "interval": interval}
     
     message = await update.message.reply_text(
         f"✅ *Started continuous monitoring* (every {interval} seconds).\n"
-        f"Monitoring GPU and system metrics...",
-        reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count),
+        f"Monitoring GPU and system metrics... 📊💻",
+        reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count, chat_id=chat_id),
         parse_mode='Markdown'
     )
     last_message_ids[chat_id] = message.message_id
     monitoring_jobs[chat_id]["message_id"] = message.message_id
-    log_message(f"Started monitoring for chat {chat_id}")
+    log_message(f"Started monitoring for chat {chat_id} with interval {interval}s")
 
 async def monitor_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = context.job.context
+    chat_id = context.job.data
     if chat_id not in monitoring_jobs:
         return
     
@@ -530,7 +626,7 @@ async def monitor_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                 message_id=monitoring_jobs[chat_id]["message_id"],
                 text=message_content,
                 parse_mode='Markdown',
-                reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count)
+                reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count, chat_id=chat_id)
             )
     except Exception as e:
         log_message(f"Error editing monitoring message: {e}")
@@ -539,7 +635,7 @@ async def monitor_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             text=message_content,
             parse_mode='Markdown',
-            reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count)
+            reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count, chat_id=chat_id)
         )
         monitoring_jobs[chat_id]["message_id"] = message.message_id
         last_message_ids[chat_id] = message.message_id
@@ -551,7 +647,7 @@ async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if chat_id not in monitoring_jobs:
         message = await update.message.reply_text(
             "ℹ️ *No continuous monitoring* is running.",
-            reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count),
+            reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count, chat_id=chat_id),
             parse_mode='Markdown'
         )
         last_message_ids[chat_id] = message.message_id
@@ -562,7 +658,7 @@ async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     message = await update.message.reply_text(
         "🛑 *Stopped continuous monitoring*.",
-        reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count),
+        reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count, chat_id=chat_id),
         parse_mode='Markdown'
     )
     last_message_ids[chat_id] = message.message_id
@@ -572,7 +668,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
-    
     await delete_previous_message(context, chat_id)
     
     if query.data.startswith("gpu_"):
@@ -580,52 +675,130 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         message = await query.message.reply_text(
             await get_gpu_metrics(gpu_index=gpu_index),
             parse_mode='Markdown',
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
     elif query.data == "gpu":
         message = await query.message.reply_text(
             await get_gpu_metrics(gpu_index=0),
             parse_mode='Markdown',
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
     elif query.data == "system":
         message = await query.message.reply_text(
             await get_system_metrics(),
             parse_mode='Markdown',
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
     elif query.data == "processes":
         message = await query.message.reply_text(
             await get_gpu_processes(),
             parse_mode='Markdown',
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
     elif query.data == "watch_process":
+        message_text, keyboard = await list_processes_for_watching(chat_id)
         message = await query.message.reply_text(
-            await list_processes_for_watching(),
+            message_text,
             parse_mode='Markdown',
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+            reply_markup=keyboard
+        )
+    elif query.data.startswith("watch_pid_"):
+        pid = query.data.split("_")[2]
+        vram_threshold = 1000
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', '--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            processes = result.stdout.strip().split('\n') if result.stdout.strip() else []
+            for line in processes:
+                proc_pid, proc_name, _ = line.split(', ')
+                if proc_pid == pid:
+                    if chat_id not in PROCESS_ALERTS:
+                        PROCESS_ALERTS[chat_id] = {}
+                    PROCESS_ALERTS[chat_id][pid] = {
+                        "name": proc_name,
+                        "vram_threshold": vram_threshold,
+                        "start_time": time.time()
+                    }
+                    message = await query.message.reply_text(
+                        f"✅ *Monitoring Process*: {proc_name} (PID {pid}) for VRAM > {vram_threshold} MB.\n"
+                        "Use /status to view all watched processes.",
+                        parse_mode='Markdown',
+                        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+                    )
+                    log_message(f"Started watching {proc_name} (PID {pid}) for chat {chat_id} via button")
+                    break
+            else:
+                message = await query.message.reply_text(
+                    f"🚨 *Error*: Process with PID {pid} not found.",
+                    parse_mode='Markdown',
+                    reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+                )
+        except Exception as e:
+            message = await query.message.reply_text(
+                f"🚨 *Error*: Failed to fetch processes.\n*Details*: {str(e)}",
+                parse_mode='Markdown',
+                reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+            )
+    elif query.data == "stop_watching":
+        if chat_id not in PROCESS_ALERTS or not PROCESS_ALERTS[chat_id]:
+            message = await query.message.reply_text(
+                "ℹ️ *No processes* are being watched.",
+                parse_mode='Markdown',
+                reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+            )
+        else:
+            buttons = [
+                [InlineKeyboardButton(f"Stop {config['name']} (PID {pid})", callback_data=f"stop_pid_{pid}")]
+                for pid, config in PROCESS_ALERTS[chat_id].items()
+            ]
+            buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="back")])
+            message = await query.message.reply_text(
+                "🛑 *Select a process to stop watching*:",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+    elif query.data.startswith("stop_pid_"):
+        pid = query.data.split("_")[2]
+        if chat_id in PROCESS_ALERTS and pid in PROCESS_ALERTS[chat_id]:
+            proc_name = PROCESS_ALERTS[chat_id][pid]["name"]
+            del PROCESS_ALERTS[chat_id][pid]
+            if not PROCESS_ALERTS[chat_id]:
+                del PROCESS_ALERTS[chat_id]
+            message = await query.message.reply_text(
+                f"✅ *Stopped watching*: {proc_name} (PID {pid}).",
+                parse_mode='Markdown',
+                reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+            )
+            log_message(f"Stopped watching {proc_name} (PID {pid}) for chat {chat_id}")
+        else:
+            message = await query.message.reply_text(
+                f"ℹ️ *Process* with PID {pid} is not being watched.",
+                parse_mode='Markdown',
+                reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+            )
+    elif query.data == "status":
+        message = await query.message.reply_text(
+            await status(None, context),  # Reuse status handler
+            parse_mode='Markdown',
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
     elif query.data == "help":
         message = await query.message.reply_text(
-            "❓ *Help - GPU & System Monitoring Bot*\n"
-            "Available commands and buttons:\n"
-            "- 📊 *GPU Metrics*: Fetch GPU utilization, VRAM, temperature, power draw\n"
-            "- 💻 *System Metrics*: Fetch CPU, RAM, disk I/O, network I/O, uptime\n"
-            "- 🔄 *GPU Processes*: List processes using GPUs\n"
-            "- ⚠️ *Watch Process*: Monitor a process by PID or name\n"
-            "- ▶️ *Start Monitoring*: Start continuous updates (every 60s)\n"
-            "- ⏹️ *Stop Monitoring*: Stop continuous updates\n"
-            "- ❓ *Help*: Show this message\n\n"
-            "Click a button to proceed!",
+            await help_command(None, context),  # Reuse help handler
             parse_mode='Markdown',
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
     elif query.data == "start_monitoring":
         if chat_id in monitoring_jobs:
+            interval = monitoring_jobs[chat_id]["interval"]
             message = await query.message.reply_text(
-                "ℹ️ *Continuous monitoring* is already running. Use the Stop Monitoring button.",
-                reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count),
+                f"ℹ️ *Continuous monitoring* is already running (every {interval} seconds).\n"
+                "Use the Stop Monitoring button to stop.",
+                reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count, chat_id=chat_id),
                 parse_mode='Markdown'
             )
         else:
@@ -633,23 +806,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             job = context.job_queue.run_repeating(
                 monitor_callback,
                 interval=interval,
-                context=chat_id,
+                first=0,
+                data=chat_id,
                 name=str(chat_id)
             )
-            monitoring_jobs[chat_id] = {"job": job, "message_id": None}
+            monitoring_jobs[chat_id] = {"job": job, "message_id": None, "interval": interval}
             message = await query.message.reply_text(
                 f"✅ *Started continuous monitoring* (every {interval} seconds).\n"
-                f"Monitoring GPU and system metrics...",
-                reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count),
+                f"Monitoring GPU and system metrics... 📊💻",
+                reply_markup=get_keyboard(is_monitoring=True, gpu_count=gpu_count, chat_id=chat_id),
                 parse_mode='Markdown'
             )
             monitoring_jobs[chat_id]["message_id"] = message.message_id
-            log_message(f"Started monitoring for chat {chat_id}")
+            log_message(f"Started monitoring for chat {chat_id} with interval {interval}s")
     elif query.data == "stop_monitoring":
         if chat_id not in monitoring_jobs:
             message = await query.message.reply_text(
                 "ℹ️ *No continuous monitoring* is running.",
-                reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count),
+                reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count, chat_id=chat_id),
                 parse_mode='Markdown'
             )
         else:
@@ -657,7 +831,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             del monitoring_jobs[chat_id]
             message = await query.message.reply_text(
                 "🛑 *Stopped continuous monitoring*.",
-                reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count),
+                reply_markup=get_keyboard(is_monitoring=False, gpu_count=gpu_count, chat_id=chat_id),
                 parse_mode='Markdown'
             )
             log_message(f"Stopped monitoring for chat {chat_id}")
@@ -668,10 +842,27 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         }
         message = await query.message.reply_text(
             "🔇 *Alerts snoozed* for 5 minutes.",
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count),
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id),
             parse_mode='Markdown'
         )
+    elif query.data == "back":
+        message = await query.message.reply_text(
+            "🔙 *Back to main menu*",
+            parse_mode='Markdown',
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+        )
     
+    last_message_ids[chat_id] = message.message_id
+
+# Handle unknown commands
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.message.chat_id
+    await delete_previous_message(context, chat_id)
+    message = await update.message.reply_text(
+        "🤔 *Unknown command*.\nUse /help to see available commands or try the buttons below.",
+        parse_mode='Markdown',
+        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+    )
     last_message_ids[chat_id] = message.message_id
 
 def main() -> None:
@@ -684,9 +875,11 @@ def main() -> None:
     app.add_handler(CommandHandler("processes", processes))
     app.add_handler(CommandHandler("watch_process", watch_process))
     app.add_handler(CommandHandler("watch", watch))
+    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("start_monitoring", start_monitoring))
     app.add_handler(CommandHandler("stop_monitoring", stop_monitoring))
     app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     
     app.run_polling()
 
