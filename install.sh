@@ -30,6 +30,11 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Remove old files
+echo -e "${GREEN}Cleaning old files...${NC}"
+rm -rf monitoring
+rm -rf /var/log/system_monitor.log
+
 # Install system dependencies
 echo -e "${GREEN}Installing system dependencies...${NC}"
 apt update
