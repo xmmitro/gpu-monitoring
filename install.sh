@@ -59,16 +59,17 @@ echo -e "${GREEN}Installing Python dependencies...${NC}"
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Prompt for Telegram bot token
-echo -e "${GREEN}Please enter your Telegram Bot Token:${NC}"
-read -r BOT_TOKEN
+# Replace the token prompt section in install.sh with:
+BOT_TOKEN="${BOT_TOKEN:-}"
 if [ -z "$BOT_TOKEN" ]; then
     echo -e "${RED}Bot token is required!${NC}"
-    exit 1
+    echo -e "${GREEN}Please enter your Telegram Bot Token:${NC}"
+    read -r BOT_TOKEN
+    if [ -z "$BOT_TOKEN" ]; then
+        echo -e "${RED}Bot token is required!${NC}"
+        exit 1
+    fi
 fi
-
-# Update bot.py with the token
-sed -i "s/YOUR_BOT_TOKEN/$BOT_TOKEN/" bot.py
 
 # Make bot.py executable
 chmod +x bot.py
