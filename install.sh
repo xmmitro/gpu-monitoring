@@ -17,8 +17,10 @@ cat << "EOF"
      .##.....##...##.##.........##.##.....##.##.....##..##.....##....##...##...##.....##
      ..##...##...##...##..##....##.##.....##.##.....##..##.....##....##....##..##.....##
      ...#####...##.....##..######...#######..##.....##.####....##....##.....##..#######.
+     
      X: x.com/0xsumitro                                                         
 EOF
+
 
 echo -e "${GREEN}Starting GPU Monitoring Bot installation...${NC}"
 
@@ -31,10 +33,10 @@ fi
 # Install system dependencies
 echo -e "${GREEN}Installing system dependencies...${NC}"
 apt update
-apt install -y python3 python3-pip screen nvidia-driver-535 nvidia-utils-535
+# apt install -y python3 python3-pip screen nvidia-driver-535 nvidia-utils-535
 
 # Create project directory
-INSTALL_DIR="/root/live-monitoring"
+INSTALL_DIR="/root/monitoring"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
