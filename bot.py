@@ -10,7 +10,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Configuration
-BOT_TOKEN = "8091891864:AAEfUJ97iZ77bKEq5Ysn1XIu6rKA6F6I1hQ"  # Replace with your Telegram Bot Token
+BOT_TOKEN = "8091891864:AAEfUJ97iZ77bKEq5Ysn1XIu6rKA6F6I1hQ"  # Replaced by install.sh
 LOG_FILE = "/var/log/gpu_monitor.log"
 THRESHOLDS = {
     "gpu_util": 80,  # Alert if GPU utilization > 80%
@@ -24,13 +24,13 @@ ALERT_CONFIG = {
     "vram_alert_threshold": 95,  # Alert if VRAM usage > 95%
     "snooze_duration": 300,  # Snooze alerts for 5 minutes
 }
-PROCESS_ALERTS = {}  # Store process-specific alerts {chat_id: {pid: {name, vram_threshold}}}
-
-# Global state
+PROCESS_ALERTS = {}  # {chat_id: {pid: {name, vram_threshold}}}
 monitoring_jobs = {}  # {chat_id: {job, message_id}}
 last_message_ids = {}  # {chat_id: message_id}
 alert_snooze = {}  # {chat_id: {metric: timestamp}}
-gpu_count = 0  # Number of GPUs detected
+gpu_count = 0  # Number of GPUs
+gpu_util_history = []  # For ASCII charts
+cpu_usage_history = []
 
 # Setup logging
 logging.basicConfig(
@@ -89,11 +89,11 @@ def generate_ascii_chart(values: list, width: int = 20, height: int = 5) -> str:
         chart.append("".join(line))
     return "```\n" + "\n".join(chart) + "\n```"
 
-# Function to log messages
+# Log messages
 def log_message(message: str) -> None:
     logger.info(message)
 
-# Function to delete previous message
+# Delete previous message
 async def delete_previous_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     if chat_id in last_message_ids:
         try:
@@ -102,7 +102,7 @@ async def delete_previous_message(context: ContextTypes.DEFAULT_TYPE, chat_id: i
             log_message(f"Failed to delete message {last_message_ids[chat_id]}: {e}")
         del last_message_ids[chat_id]
 
-# Function to detect GPU count
+# Detect GPU count
 def detect_gpu_count() -> int:
     try:
         result = subprocess.run(
@@ -113,9 +113,9 @@ def detect_gpu_count() -> int:
         )
         return int(result.stdout.strip())
     except (FileNotFoundError, subprocess.CalledProcessError):
-        return 1  # Assume single GPU if detection fails
+        return 1
 
-# Function to get NVIDIA GPU metrics
+# Get NVIDIA GPU metrics
 async def get_gpu_metrics(gpu_index: int = 0) -> str:
     try:
         result = subprocess.run(
@@ -138,11 +138,10 @@ async def get_gpu_metrics(gpu_index: int = 0) -> str:
         
         vram_usage = (vram_used / vram_total) * 100
         
-        # Generate ASCII chart for GPU utilization
         gpu_util_history.append(gpu_util)
         if len(gpu_util_history) > 20:
             gpu_util_history.pop(0)
-        chart = generate_ascii_chart(gpu_util_history, width=20, height=5)
+        chart = generate_ascii_chart(gpu_util_history)
         
         message = f"📊 *GPU {index} Monitoring Report* - {subprocess.getoutput('hostname')}\n"
         message += f"*GPU*: {gpu_name}\n"
@@ -153,12 +152,6 @@ async def get_gpu_metrics(gpu_index: int = 0) -> str:
         message += f"*Power Draw*: {power} W\n"
         message += f"*Utilization Chart*:\n{chart}"
         
-        # Check for critical alerts
-        if vram_usage > ALERT_CONFIG["vram_alert_threshold"] and not is_snoozed(chat_id, "vram"):
-            await send_alert(context, chat_id, f"🚨 *Critical VRAM Usage* on GPU {index}: {vram_usage:.2f}%")
-        if temp > THRESHOLDS["temp"] and not is_snoozed(chat_id, "temp"):
-            await send_alert(context, chat_id, f"🚨 *High Temperature* on GPU {index}: {temp}°C")
-        
         log_message(f"GPU {index} Metrics: {gpu_name}, Util: {gpu_util}%, Mem: {mem_util}%, VRAM: {vram_used}/{vram_total} MB, Temp: {temp}°C, Power: {power} W")
         return message
     except FileNotFoundError:
@@ -167,7 +160,7 @@ async def get_gpu_metrics(gpu_index: int = 0) -> str:
         log_message(f"Error fetching GPU {gpu_index} metrics: {e}")
         return f"🚨 *Error*: Failed to fetch GPU {gpu_index} metrics.\n*Details*: {e.stderr}"
 
-# Function to get system metrics
+# Get system metrics
 async def get_system_metrics() -> str:
     try:
         cpu_usage = psutil.cpu_percent(interval=1)
@@ -186,16 +179,14 @@ async def get_system_metrics() -> str:
         net_sent = net_io.bytes_sent / (1024 ** 2)
         net_recv = net_io.bytes_recv / (1024 ** 2)
         
-        # System uptime and load
         uptime_seconds = time.time() - psutil.boot_time()
         uptime = f"{int(uptime_seconds // 86400)}d {int((uptime_seconds % 86400) // 3600)}h {int((uptime_seconds % 3600) // 60)}m"
         load_avg = psutil.getloadavg()
         
-        # ASCII chart for CPU usage
         cpu_usage_history.append(cpu_usage)
         if len(cpu_usage_history) > 20:
             cpu_usage_history.pop(0)
-        chart = generate_ascii_chart(cpu_usage_history, width=20, height=5)
+        chart = generate_ascii_chart(cpu_usage_history)
         
         message = f"💻 *System Monitoring Report* - {subprocess.getoutput('hostname')}\n"
         message += f"*Uptime*: {uptime}\n"
@@ -213,7 +204,7 @@ async def get_system_metrics() -> str:
         log_message(f"Error fetching system metrics: {e}")
         return f"🚨 *Error*: Failed to fetch system metrics.\n*Details*: {str(e)}"
 
-# Function to get GPU-related processes
+# Get GPU processes
 async def get_gpu_processes() -> str:
     try:
         result = subprocess.run(
@@ -240,7 +231,7 @@ async def get_gpu_processes() -> str:
         log_message(f"Error fetching GPU processes: {e}")
         return f"🚨 *Error*: Failed to fetch GPU processes.\n*Details*: {e.stderr}"
 
-# Function to get GPU index from UUID
+# Get GPU index from UUID
 def get_gpu_index_from_uuid(uuid: str) -> str:
     try:
         result = subprocess.run(
@@ -257,7 +248,7 @@ def get_gpu_index_from_uuid(uuid: str) -> str:
     except:
         return "Unknown"
 
-# Function to list processes for watching
+# List processes for watching
 async def list_processes_for_watching() -> str:
     try:
         result = subprocess.run(
@@ -284,7 +275,7 @@ async def list_processes_for_watching() -> str:
         log_message(f"Error listing GPU processes: {e}")
         return f"🚨 *Error*: Failed to list GPU processes.\n*Details*: {e.stderr}"
 
-# Function to check process alerts
+# Check process alerts
 async def check_process_alerts(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     if chat_id not in PROCESS_ALERTS:
         return
@@ -320,7 +311,7 @@ async def check_process_alerts(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
     except Exception as e:
         log_message(f"Error checking process alerts: {e}")
 
-# Function to send alerts
+# Send alerts
 async def send_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message: str) -> None:
     await context.bot.send_message(
         chat_id=chat_id,
@@ -331,17 +322,17 @@ async def send_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message: 
         ])
     )
 
-# Function to check if alert is snoozed
+# Check if alert is snoozed
 def is_snoozed(chat_id: int, metric: str) -> bool:
     if chat_id in alert_snooze and metric in alert_snooze[chat_id]:
         return time.time() < alert_snooze[chat_id][metric]
     return False
 
-# Telegram command handlers
+# Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global gpu_count, gpu_util_history, cpu_usage_history
     gpu_count = detect_gpu_count()
-    gpu_util_history = []  # Reset history for ASCII charts
+    gpu_util_history = []
     cpu_usage_history = []
     
     chat_id = update.message.chat_id
@@ -433,7 +424,7 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     if not context.args:
         message = await update.message.reply_text(
-            "⚠️ *Usage*: `/watch <pid>` or `/watch <process_name>`\n"
+            "⚠️ *Usage*: `/watch <pid>` or `/watch <process_name> [vram_threshold]`\n"
             "Use the Watch Process button to list available processes.",
             parse_mode='Markdown',
             reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count)
@@ -442,7 +433,7 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     
     identifier = context.args[0]
-    vram_threshold = 1000  # Default VRAM threshold (1GB)
+    vram_threshold = 1000
     if len(context.args) > 1:
         try:
             vram_threshold = int(context.args[1])
