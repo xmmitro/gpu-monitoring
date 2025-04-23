@@ -7,12 +7,12 @@ import time
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # Configuration
 BOT_TOKEN = "YOUR_BOT_TOKEN"  # Replaced by install.sh
-LOG_FILE = "/var/log/system_monitor.log"
+LOG_FILE = "/var/log/gpu_monitor.log"
 THRESHOLDS = {
     "gpu_util": 80,  # Alert if GPU utilization > 80%
     "mem_util": 80,  # Alert if memory utilization > 80%
@@ -386,11 +386,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     last_message_ids[chat_id] = message.message_id
     log_message(f"Bot started for chat {chat_id}")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.message.chat_id
-    await delete_previous_message(context, chat_id)
+async def help_command(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int] = None) -> str:
+    # Handle both command and button contexts
+    if update and update.message:
+        chat_id = update.message.chat_id
+        await delete_previous_message(context, chat_id)
     
-    message = await update.message.reply_text(
+    if not chat_id:
+        return "🚨 *Error*: Unable to determine chat ID."
+    
+    message = (
         "❓ *GPU & System Monitoring Bot Help* 🛠️\n\n"
         "*Commands:*\n"
         "- /start: Initialize the bot\n"
@@ -410,11 +415,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- ⚠️ Watch Process\n"
         "- 📈 Status\n"
         "- ▶️ Start/⏹️ Stop Monitoring\n\n"
-        "Click a button to explore!",
-        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id),
-        parse_mode='Markdown'
+        "Click a button to explore!"
     )
-    last_message_ids[chat_id] = message.message_id
+    
+    if update and update.message:
+        sent_message = await update.message.reply_text(
+            message,
+            parse_mode='Markdown',
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+        )
+        last_message_ids[chat_id] = sent_message.message_id
+    return message
 
 async def gpu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
@@ -534,9 +545,14 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     last_message_ids[chat_id] = message.message_id
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.message.chat_id
-    await delete_previous_message(context, chat_id)
+async def status(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int] = None) -> str:
+    # Handle both command and button contexts
+    if update and update.message:
+        chat_id = update.message.chat_id
+        await delete_previous_message(context, chat_id)
+    
+    if not chat_id:
+        return "🚨 *Error*: Unable to determine chat ID."
     
     message = f"📈 *Monitoring Status* - {subprocess.getoutput('hostname')} 🖥️\n\n"
     if chat_id in monitoring_jobs:
@@ -554,12 +570,15 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message += "\n⚠️ *Watched Processes*: None\n"
     
     message += "\nUse buttons to start/stop monitoring or watch processes."
-    message = await update.message.reply_text(
-        message,
-        parse_mode='Markdown',
-        reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
-    )
-    last_message_ids[chat_id] = message.message_id
+    
+    if update and update.message:
+        sent_message = await update.message.reply_text(
+            message,
+            parse_mode='Markdown',
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
+        )
+        last_message_ids[chat_id] = sent_message.message_id
+    return message
 
 async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
@@ -782,13 +801,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
     elif query.data == "status":
         message = await query.message.reply_text(
-            await status(None, context),  # Reuse status handler
+            await status(None, context, chat_id=chat_id),
             parse_mode='Markdown',
             reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
     elif query.data == "help":
         message = await query.message.reply_text(
-            await help_command(None, context),  # Reuse help handler
+            await help_command(None, context, chat_id=chat_id),
             parse_mode='Markdown',
             reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
@@ -842,8 +861,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         }
         message = await query.message.reply_text(
             "🔇 *Alerts snoozed* for 5 minutes.",
-            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id),
-            parse_mode='Markdown'
+            parse_mode='Markdown',
+            reply_markup=get_keyboard(is_monitoring=chat_id in monitoring_jobs, gpu_count=gpu_count, chat_id=chat_id)
         )
     elif query.data == "back":
         message = await query.message.reply_text(
