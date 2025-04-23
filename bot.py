@@ -12,7 +12,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # Configuration
 BOT_TOKEN = "YOUR_BOT_TOKEN"  # Replaced by install.sh
-LOG_FILE = "/var/log/gpu_monitor.log"
+LOG_FILE = "/var/log/system_monitor.log"
 THRESHOLDS = {
     "gpu_util": 80,  # Alert if GPU utilization > 80%
     "mem_util": 80,  # Alert if memory utilization > 80%
