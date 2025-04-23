@@ -18,7 +18,7 @@ cat << "EOF"
      ..##...##...##...##..##....##.##.....##.##.....##..##.....##....##....##..##.....##
      ...#####...##.....##..######...#######..##.....##.####....##....##.....##..#######.
      
-     x.com/0xsumitro   
+     X: x.com/0xsumitro   
 
 EOF
 
@@ -61,15 +61,31 @@ pip install -r requirements.txt
 # Get Telegram bot token
 echo -e "${GREEN}Please enter your Telegram Bot Token (obtained from @BotFather):${NC}"
 echo -e "${GREEN}Example: 1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890${NC}"
-while true; do
-    read -r BOT_TOKEN
+echo -e "${GREEN}You have 3 attempts to enter a valid token.${NC}"
+attempts=3
+while [ $attempts -gt 0 ]; do
+    read -r BOT_TOKEN </dev/tty || {
+        echo -e "${RED}Error: Cannot read input. Run the script locally: curl -s $REPO_URL/main/install.sh > install.sh; sudo bash install.sh${NC}"
+        exit 1
+    }
     if [ -z "$BOT_TOKEN" ]; then
-        echo -e "${RED}Bot token is required! Please enter a valid token.${NC}"
-    else
+        attempts=$((attempts-1))
+        echo -e "${RED}Bot token is required! $attempts attempts remaining.${NC}"
+        continue
+    fi
+    # Basic token format validation (e.g., number:alphanumeric)
+    if echo "$BOT_TOKEN" | grep -qE '^[0-9]+:[A-Za-z0-9_-]+$'; then
         echo -e "${GREEN}Token received. Proceeding...${NC}"
         break
+    else
+        attempts=$((attempts-1))
+        echo -e "${RED}Invalid token format! Must be like '1234567890:XYZ...'. $attempts attempts remaining.${NC}"
     fi
 done
+if [ $attempts -eq 0 ]; then
+    echo -e "${RED}Failed to provide a valid token after 3 attempts. Exiting.${NC}"
+    exit 1
+fi
 
 # Update bot.py with the token
 sed -i "s/YOUR_BOT_TOKEN/$BOT_TOKEN/" bot.py
@@ -78,8 +94,8 @@ sed -i "s/YOUR_BOT_TOKEN/$BOT_TOKEN/" bot.py
 chmod +x bot.py
 
 # Ensure log file permissions
-touch /var/log/gpu_monitor.log
-chmod 666 /var/log/gpu_monitor.log
+touch /var/log/system_monitor.log
+chmod 666 /var/log/system_monitor.log
 
 # Start bot in a screen session
 echo -e "${GREEN}Starting bot in a screen session named 'gpubot'...${NC}"
@@ -93,4 +109,4 @@ echo -e "${GREEN}Installation complete!${NC}"
 echo -e "The bot is running in a screen session named 'gpubot'."
 echo -e "To check the bot, reattach with: ${GREEN}screen -r gpubot${NC}"
 echo -e "To start interacting, open Telegram and send /start to your bot."
-echo -e "Logs are saved to /var/log/gpu_monitor.log"
+echo -e "Logs are saved to /var/log/system_monitor.log"
