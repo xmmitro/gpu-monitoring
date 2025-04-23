@@ -59,10 +59,9 @@ echo -e "${GREEN}Installing Python dependencies...${NC}"
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Replace the token prompt section in install.sh with:
+# Get Telegram bot token
 BOT_TOKEN="${BOT_TOKEN:-}"
 if [ -z "$BOT_TOKEN" ]; then
-    echo -e "${RED}Bot token is required!${NC}"
     echo -e "${GREEN}Please enter your Telegram Bot Token:${NC}"
     read -r BOT_TOKEN
     if [ -z "$BOT_TOKEN" ]; then
@@ -70,6 +69,9 @@ if [ -z "$BOT_TOKEN" ]; then
         exit 1
     fi
 fi
+
+# Update bot.py with the token
+sed -i "s/YOUR_BOT_TOKEN/$BOT_TOKEN/" bot.py
 
 # Make bot.py executable
 chmod +x bot.py
@@ -79,12 +81,12 @@ touch /var/log/gpu_monitor.log
 chmod 666 /var/log/gpu_monitor.log
 
 # Start bot in a screen session
-echo -e "${GREEN}Starting bot in a screen session named 'gpu_bot'...${NC}"
-screen -dmS gpu_bot bash -c "./bot.py; exec bash"
+echo -e "${GREEN}Starting bot in a screen session named 'gpubot'...${NC}"
+screen -dmS gpubot bash -c "./bot.py; exec bash"
 
 # Add to crontab for auto-start
-echo -e "${GREEN}Adding bot to crontab for auto-start on reboot...${NC}"
-(crontab -l 2>/dev/null; echo "@reboot /root/live-monitoring/.venv/bin/python3 /root/live-monitoring/bot.py") | crontab -
+# echo -e "${GREEN}Adding bot to crontab for auto-start on reboot...${NC}"
+# (crontab -l 2>/dev/null; echo "@reboot /root/live-monitoring/.venv/bin/python3 /root/live-monitoring/bot.py") | crontab -
 
 echo -e "${GREEN}Installation complete!${NC}"
 echo -e "The bot is running in a screen session named 'gpu_bot'."
