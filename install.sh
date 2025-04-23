@@ -18,10 +18,9 @@ cat << "EOF"
      ..##...##...##...##..##....##.##.....##.##.....##..##.....##....##....##..##.....##
      ...#####...##.....##..######...#######..##.....##.####....##....##.....##..#######.
      
-     X: x.com/0xsumitro   
+     x.com/0xsumitro   
 
 EOF
-
 
 echo -e "${GREEN}Starting GPU Monitoring Bot installation...${NC}"
 
@@ -60,15 +59,17 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 # Get Telegram bot token
-BOT_TOKEN="${BOT_TOKEN:-}"
-if [ -z "$BOT_TOKEN" ]; then
-    echo -e "${GREEN}Please enter your Telegram Bot Token:${NC}"
+echo -e "${GREEN}Please enter your Telegram Bot Token (obtained from @BotFather):${NC}"
+echo -e "${GREEN}Example: 1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890${NC}"
+while true; do
     read -r BOT_TOKEN
     if [ -z "$BOT_TOKEN" ]; then
-        echo -e "${RED}Bot token is required!${NC}"
-        exit 1
+        echo -e "${RED}Bot token is required! Please enter a valid token.${NC}"
+    else
+        echo -e "${GREEN}Token received. Proceeding...${NC}"
+        break
     fi
-fi
+done
 
 # Update bot.py with the token
 sed -i "s/YOUR_BOT_TOKEN/$BOT_TOKEN/" bot.py
@@ -89,7 +90,7 @@ screen -dmS gpubot bash -c "./bot.py; exec bash"
 # (crontab -l 2>/dev/null; echo "@reboot /root/live-monitoring/.venv/bin/python3 /root/live-monitoring/bot.py") | crontab -
 
 echo -e "${GREEN}Installation complete!${NC}"
-echo -e "The bot is running in a screen session named 'gpu_bot'."
-echo -e "To check the bot, reattach with: ${GREEN}screen -r gpu_bot${NC}"
+echo -e "The bot is running in a screen session named 'gpubot'."
+echo -e "To check the bot, reattach with: ${GREEN}screen -r gpubot${NC}"
 echo -e "To start interacting, open Telegram and send /start to your bot."
 echo -e "Logs are saved to /var/log/gpu_monitor.log"
