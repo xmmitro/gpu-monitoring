@@ -8,7 +8,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
-echo -e "\033[38;5;224m"
+echo -e "\033[0m"
 cat << "EOF"
      ...#####...##.....##..######..##.....##.##.....##.####.########.########...#######.
      ..##...##...##...##..##....##.##.....##.###...###..##.....##....##.....##.##.....##
@@ -18,7 +18,8 @@ cat << "EOF"
      ..##...##...##...##..##....##.##.....##.##.....##..##.....##....##....##..##.....##
      ...#####...##.....##..######...#######..##.....##.####....##....##.....##..#######.
      
-     X: x.com/0xsumitro                                                         
+     X: x.com/0xsumitro   
+
 EOF
 
 
@@ -41,7 +42,7 @@ mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
 # Clone the GitHub repository
-REPO_URL="https://github.com/<your-username>/gpu-monitoring-bot.git"
+REPO_URL="https://github.com/xmmitro/gpu-monitoring"
 echo -e "${GREEN}Cloning repository from $REPO_URL...${NC}"
 git clone "$REPO_URL" . || {
     echo -e "${RED}Failed to clone repository. Check the URL or network.${NC}"
